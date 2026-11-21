@@ -20,6 +20,7 @@ from pytest_mock import MockerFixture
 
 import anyio.to_thread
 from anyio import (
+    CancelScope,
     CapacityLimiter,
     Event,
     create_task_group,
@@ -424,6 +425,118 @@ async def test_cancel_worker_thread(
     assert last_active == expected_last_active
 
 
+async def test_task_group_failure_abandons_blocked_worker() -> None:
+    started = Event()
+    release = threading.Event()
+
+    def blocking_worker() -> None:
+        from_thread.run_sync(started.set)
+        release.wait(5)
+
+    async def failing_worker() -> None:
+        await started.wait()
+        raise RuntimeError("boom")
+
+    start_time = time.monotonic()
+    try:
+        with pytest.RaisesGroup(pytest.RaisesExc(RuntimeError, match="boom")):
+            async with create_task_group() as tg:
+                tg.start_soon(to_thread.run_sync, blocking_worker)
+                tg.start_soon(failing_worker)
+    finally:
+        release.set()
+
+    assert time.monotonic() - start_time < 1
+
+
+async def test_task_group_failure_waits_for_worker_cleanup() -> None:
+    started = Event()
+    release = threading.Event()
+    cleaned_up = False
+
+    def blocking_worker_func() -> None:
+        from_thread.run_sync(started.set)
+        release.wait(5)
+
+    def cleanup_worker() -> None:
+        nonlocal cleaned_up
+        time.sleep(0.1)
+        cleaned_up = True
+
+    async def blocking_worker() -> None:
+        try:
+            await to_thread.run_sync(blocking_worker_func)
+        finally:
+            with CancelScope(shield=True):
+                await to_thread.run_sync(cleanup_worker)
+
+    async def failing_worker() -> None:
+        await started.wait()
+        raise RuntimeError("boom")
+
+    start_time = time.monotonic()
+    try:
+        with pytest.RaisesGroup(pytest.RaisesExc(RuntimeError, match="boom")):
+            async with create_task_group() as tg:
+                tg.start_soon(blocking_worker)
+                tg.start_soon(failing_worker)
+    finally:
+        release.set()
+
+    assert cleaned_up
+    assert time.monotonic() - start_time < 1
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_abandoned_worker_uses_daemon_thread() -> None:
+    assert await to_thread.run_sync(
+        lambda: threading.current_thread().daemon, abandon_on_cancel=True
+    )
+    assert not await to_thread.run_sync(lambda: threading.current_thread().daemon)
+
+
+def test_task_group_failure_does_not_block_interpreter_shutdown() -> None:
+    script = dedent(
+        """
+        import time
+
+        import anyio
+        import anyio.to_thread
+
+
+        async def blocking_worker() -> None:
+            await anyio.to_thread.run_sync(time.sleep, 30)
+
+
+        async def failing_worker() -> None:
+            await anyio.sleep(0.1)
+            raise RuntimeError("boom")
+
+
+        async def main() -> None:
+            try:
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(blocking_worker)
+                    tg.start_soon(failing_worker)
+            except BaseException:
+                pass
+
+            print("finished", flush=True)
+
+
+        anyio.run(main, backend="asyncio")
+        """
+    )
+    process = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert process.stdout == "finished\n"
+
+
 def test_asyncio_worker_thread_loop_closed_during_result_report(
     mocker: MockerFixture,
 ) -> None:
@@ -481,7 +594,13 @@ def test_asyncio_worker_thread_loop_closed_during_result_report(
         release_result_report.set()
 
     worker_threads[0].queue.join()  # type: ignore[attr-defined]
-    assert anyio.run(to_thread.run_sync, threading.current_thread) is worker_threads[0]
+    assert (
+        anyio.run(
+            partial(to_thread.run_sync, abandon_on_cancel=True),
+            threading.current_thread,
+        )
+        is worker_threads[0]
+    )
 
 
 async def test_cancel_wait_on_thread() -> None:

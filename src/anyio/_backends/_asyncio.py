@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import _thread
 import array
 import asyncio
 import concurrent.futures
@@ -32,7 +33,7 @@ from collections.abc import (
 )
 from concurrent.futures import Future
 from contextlib import AbstractContextManager, suppress
-from contextvars import Context, copy_context
+from contextvars import Context, Token, copy_context
 from dataclasses import dataclass, field
 from functools import partial, wraps
 from inspect import (
@@ -56,6 +57,7 @@ from typing import (
     TypeVar,
     cast,
 )
+from warnings import warn
 from weakref import WeakKeyDictionary
 
 from .. import (
@@ -91,7 +93,7 @@ from .._core._synchronization import (
 )
 from .._core._synchronization import Semaphore as BaseSemaphore
 from .._core._tasks import CancelScope as BaseCancelScope
-from .._core._tasks import TaskHandle
+from .._core._tasks import TaskHandle, _current_task_group
 from ..abc import (
     AsyncBackend,
     IPSockAddrType,
@@ -622,6 +624,8 @@ class TaskGroup(abc.TaskGroup):
         self._exceptions: list[BaseException] = []
         self._tasks: set[asyncio.Task] = set()
         self._on_completed_fut: asyncio.Future[None] | None = None
+        self._abandon_callbacks: set[Callable[[], None]] = set()
+        self._task_group_token: Token[abc.TaskGroup | None] | None = None
 
     async def __aenter__(self) -> Self:
         if self._entered:
@@ -630,7 +634,19 @@ class TaskGroup(abc.TaskGroup):
         self._entered = True
 
         self.cancel_scope.__enter__()
+        self._task_group_token = _current_task_group.set(self)
         return self
+
+    def _register_abandon_callback(
+        self, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        self._abandon_callbacks.add(callback)
+        return lambda: self._abandon_callbacks.discard(callback)
+
+    def _abandon_blocked_tasks(self) -> None:
+        callbacks, self._abandon_callbacks = self._abandon_callbacks, set()
+        for callback in callbacks:
+            callback()
 
     async def __aexit__(
         self,
@@ -640,6 +656,9 @@ class TaskGroup(abc.TaskGroup):
     ) -> bool:
         try:
             if exc_val is not None:
+                if not isinstance(exc_val, CancelledError):
+                    self._abandon_blocked_tasks()
+
                 self.cancel_scope.cancel()
                 if not isinstance(exc_val, CancelledError):
                     self._exceptions.append(exc_val)
@@ -692,6 +711,10 @@ class TaskGroup(abc.TaskGroup):
 
             return self.cancel_scope.__exit__(exc_type, exc_val, exc_tb)
         finally:
+            if self._task_group_token is not None:
+                _current_task_group.reset(self._task_group_token)
+                self._task_group_token = None
+
             del exc_val, exc_tb, self._exceptions
 
     def _spawn(
@@ -730,6 +753,9 @@ class TaskGroup(abc.TaskGroup):
                 exc = e
 
             if exc is not None:
+                if not isinstance(exc, CancelledError):
+                    self._abandon_blocked_tasks()
+
                 # The future can only be in the cancelled state if the host task was
                 # cancelled, so return immediately instead of adding one more
                 # CancelledError to the exceptions list
@@ -877,8 +903,9 @@ _Retval_Queue_Type = tuple[T_Retval | None, BaseException | None]
 
 
 class WorkerThreadPool:
-    def __init__(self, max_idle_time: float = 10) -> None:
+    def __init__(self, max_idle_time: float = 10, *, daemon: bool = False) -> None:
         self.max_idle_time = max_idle_time
+        self.daemon = daemon
         self.lock = threading.Lock()
         self.workers: set[WorkerThread] = set()
         self.idle_workers: dict[WorkerThread, None] = {}
@@ -945,7 +972,7 @@ class WorkerThread(Thread):
         if sys.version_info >= (3, 14):
             kwargs["context"] = Context()
 
-        super().__init__(name="AnyIO worker thread", daemon=False, **kwargs)
+        super().__init__(name="AnyIO worker thread", daemon=pool.daemon, **kwargs)
         self.pool = pool
         self.queue: Queue[
             tuple[Context, Callable, tuple, asyncio.Future, CancelScope] | None
@@ -1028,20 +1055,29 @@ class WorkerThread(Thread):
                 self.pool.workers.discard(self)
 
 
+_daemon_threads_supported = getattr(_thread, "daemon_threads_allowed", lambda: True)()
 _threadpool = WorkerThreadPool()
+_daemon_threadpool = WorkerThreadPool(daemon=True)
+
+
+def _drain_threadpools() -> None:
+    _threadpool.drain()
+    _daemon_threadpool.drain()
 
 
 # Regular atexit callbacks run after Python joins non-daemon threads.
 try:
-    threading._register_atexit(lambda: _threadpool.drain())  # type: ignore[attr-defined]
+    threading._register_atexit(_drain_threadpools)  # type: ignore[attr-defined]
 except RuntimeError:
     # The main thread has already finished
     _threadpool.draining = True
+    _daemon_threadpool.draining = True
 
 
 def _reset_threadpool_after_fork() -> None:
-    global _threadpool
+    global _threadpool, _daemon_threadpool
     _threadpool = WorkerThreadPool()
+    _daemon_threadpool = WorkerThreadPool(daemon=True)
 
 
 if hasattr(os, "register_at_fork"):
@@ -2626,6 +2662,28 @@ class AsyncIOBackend(AsyncBackend):
         await cls.checkpoint()
 
         async with limiter or cls.current_default_thread_limiter():
+            task_group = _current_task_group.get()
+            if (
+                not abandon_on_cancel
+                and isinstance(task_group, TaskGroup)
+                and task_group.cancel_scope._host_task is not None
+                and task_group.cancel_scope._host_task.get_loop() is get_running_loop()
+                and not task_group.cancel_scope.cancel_called
+                and cls.current_effective_deadline() != -math.inf
+            ):
+                pool = _daemon_threadpool if _daemon_threads_supported else _threadpool
+                with CancelScope(shield=True) as scope:
+                    context = copy_context()
+                    context.run(set_current_async_library, None)
+                    worker_scope = scope._parent_scope or scope
+                    unregister = task_group._register_abandon_callback(
+                        lambda: setattr(scope, "shield", False)
+                    )
+                    try:
+                        return await pool.submit(context, func, args, worker_scope)
+                    finally:
+                        unregister()
+
             with CancelScope(shield=not abandon_on_cancel) as scope:
                 context = copy_context()
                 context.run(set_current_async_library, None)
@@ -2634,7 +2692,20 @@ class AsyncIOBackend(AsyncBackend):
                 else:
                     worker_scope = scope._parent_scope
 
-                return await _threadpool.submit(context, func, args, worker_scope)
+                pool = _threadpool
+                if abandon_on_cancel:
+                    if _daemon_threads_supported:
+                        pool = _daemon_threadpool
+                    else:
+                        warn(
+                            "abandon_on_cancel is not fully supported in a "
+                            "subinterpreter on the asyncio backend. Worker threads "
+                            "will not automatically be killed during subinterpreter "
+                            "shutdown.",
+                            stacklevel=3,
+                        )
+
+                return await pool.submit(context, func, args, worker_scope)
 
     @classmethod
     def check_cancelled(cls) -> None:

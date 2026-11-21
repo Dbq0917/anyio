@@ -1,0 +1,3 @@
+Fixed task groups waiting for blocked ``to_thread.run_sync()`` calls when a sibling
+task fails. Such calls are now abandoned, and abandoned calls no longer block
+interpreter shutdown on the asyncio backend.

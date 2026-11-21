@@ -175,7 +175,9 @@ cancellation scope and event loop of the task that submitted it.
 
 On the asyncio backend, workers are non-daemon threads. At interpreter shutdown, idle
 workers are signaled to exit immediately and busy workers finish their submitted work
-before exiting. This also applies to calls abandoned on cancellation.
+before exiting. Calls that may be abandoned on cancellation (either explicitly with
+``abandon_on_cancel=True`` or because they are running in a task group whose other
+children fail) use daemon workers instead, so they cannot block interpreter shutdown.
 
 On the Trio backend, workers are daemon threads and do not keep the Python process
 alive. If a call is abandoned on cancellation, interpreter shutdown can terminate its

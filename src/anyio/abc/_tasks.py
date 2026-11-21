@@ -99,6 +99,16 @@ class TaskGroup(metaclass=ABCMeta):
 
     cancel_scope: CancelScope
 
+    def _register_abandon_callback(
+        self, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        """
+        Register a callback to be called when a child task fails.
+
+        The returned callable unregisters the callback.
+        """
+        raise NotImplementedError
+
     def cancel(self, reason: str | None = None) -> None:
         """
         Cancel this task group's cancel scope immediately.

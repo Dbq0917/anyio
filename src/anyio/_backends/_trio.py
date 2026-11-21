@@ -17,8 +17,8 @@ from collections.abc import (
     Iterable,
     Sequence,
 )
-from contextlib import AbstractContextManager
-from contextvars import Context, copy_context
+from contextlib import AbstractContextManager, suppress
+from contextvars import Context, Token, copy_context
 from dataclasses import dataclass
 from functools import partial, wraps
 from io import IOBase
@@ -41,12 +41,16 @@ from typing import (
 
 import trio.from_thread
 import trio.lowlevel
-from outcome import Error, Outcome, Value
+from outcome import Error, Outcome, Value, capture
+from trio._threads import PARENT_TASK_DATA, Run, RunSync
 from trio.lowlevel import (
+    Abort,
     current_root_task,
     current_task,
     notify_closing,
+    start_thread_soon,
     wait_readable,
+    wait_task_rescheduled,
     wait_writable,
 )
 from trio.socket import SocketType as TrioSocketType
@@ -81,7 +85,7 @@ from .._core._synchronization import (
 )
 from .._core._synchronization import Semaphore as BaseSemaphore
 from .._core._tasks import CancelScope as BaseCancelScope
-from .._core._tasks import TaskHandle
+from .._core._tasks import TaskHandle, _current_task_group
 from ..abc import IPSockAddrType, UDPPacketType, UNIXDatagramPacketType
 from ..abc._eventloop import AsyncBackend, StrOrBytesPath
 from ..abc._tasks import T_contra, call_for_coroutine, get_callable_name, get_coro_name
@@ -218,6 +222,9 @@ class TaskGroup(abc.TaskGroup):
         self._active = False
         self._nursery_manager = trio.open_nursery(strict_exception_groups=True)
         self.cancel_scope = None  # type: ignore[assignment]
+        self._abandon_callbacks: set[Callable[[], None]] = set()
+        self._task_group_token: Token[abc.TaskGroup | None] | None = None
+        self._root_task: trio.lowlevel.Task | None = None
 
     async def __aenter__(self) -> Self:
         if self._entered:
@@ -227,7 +234,20 @@ class TaskGroup(abc.TaskGroup):
         self._active = True
         self._nursery = await self._nursery_manager.__aenter__()
         self.cancel_scope = CancelScope(self._nursery.cancel_scope)
+        self._root_task = current_root_task()
+        self._task_group_token = _current_task_group.set(self)
         return self
+
+    def _register_abandon_callback(
+        self, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        self._abandon_callbacks.add(callback)
+        return lambda: self._abandon_callbacks.discard(callback)
+
+    def _abandon_blocked_tasks(self) -> None:
+        callbacks, self._abandon_callbacks = self._abandon_callbacks, set()
+        for callback in callbacks:
+            callback()
 
     async def __aexit__(
         self,
@@ -236,6 +256,9 @@ class TaskGroup(abc.TaskGroup):
         exc_tb: TracebackType | None,
     ) -> bool:
         try:
+            if exc_val is not None and not isinstance(exc_val, trio.Cancelled):
+                self._abandon_blocked_tasks()
+
             # trio.Nursery.__exit__ returns bool; .open_nursery has wrong type
             return await self._nursery_manager.__aexit__(exc_type, exc_val, exc_tb)  # type: ignore[return-value]
         except BaseExceptionGroup as exc:
@@ -244,6 +267,10 @@ class TaskGroup(abc.TaskGroup):
 
             raise
         finally:
+            if self._task_group_token is not None:
+                _current_task_group.reset(self._task_group_token)
+                self._task_group_token = None
+
             del exc_val, exc_tb
             self._active = False
 
@@ -268,7 +295,7 @@ class TaskGroup(abc.TaskGroup):
 
         self._check_active(coro)
         final_name = get_coro_name(coro, name)
-        handle = TaskHandle(coro, final_name)
+        handle = TaskHandle(coro, final_name, on_error=self._abandon_blocked_tasks)
         if context is not None:
             context.run(
                 partial(self._nursery.start_soon, handle._run_coro, name=handle.name)
@@ -298,7 +325,7 @@ class TaskGroup(abc.TaskGroup):
             else:
                 wrapper_task_status.real_task_status = task_status
 
-            handle = TaskHandle(coro, final_name)
+            handle = TaskHandle(coro, final_name, on_error=self._abandon_blocked_tasks)
             await handle._run_coro()
 
         self._check_active()
@@ -1053,6 +1080,106 @@ class TestRunner(abc.TestRunner):
         self._call_in_runner_task(test_func, **kwargs)
 
 
+def _raise_cancelled() -> NoReturn:
+    raise trio.Cancelled._create()
+
+
+async def _run_sync_abandonable(
+    func: Callable[[Unpack[PosArgsT]], T_Retval],
+    args: tuple[*PosArgsT],
+    limiter: BaseCapacityLimiter | None,
+    task_group: abc.TaskGroup,
+) -> T_Retval:
+    task = current_task()
+    token = cast("trio.lowlevel.TrioToken", TrioBackend.current_token())
+    task_register: list[trio.lowlevel.Task | None] = [task]
+    cancel_register: list[Callable[[], NoReturn] | None] = [None]
+    abandoned = [False]
+    waiting = [False]
+    borrower = object()
+    if limiter is None:
+        limiter = TrioBackend.current_default_thread_limiter()
+
+    def abandon_now() -> None:
+        abandoned[0] = True
+        task_register[0] = None
+        if cancel_register[0] is None:
+            cancel_register[0] = _raise_cancelled
+
+        if waiting[0]:
+            waiting[0] = False
+            trio.lowlevel.reschedule(task, Error(trio.Cancelled._create()))
+
+    unregister = task_group._register_abandon_callback(abandon_now)
+    context = copy_context()
+    thread_name = f"{getattr(func, '__name__', None)} from {task.name}"
+
+    def worker_fn() -> T_Retval:
+        PARENT_TASK_DATA.token = token
+        PARENT_TASK_DATA.abandon_on_cancel = False
+        PARENT_TASK_DATA.cancel_register = cancel_register
+        PARENT_TASK_DATA.task_register = task_register
+        try:
+            with claim_worker_thread(TrioBackend, token):
+                return context.run(func, *args)
+        finally:
+            del PARENT_TASK_DATA.token
+            del PARENT_TASK_DATA.abandon_on_cancel
+            del PARENT_TASK_DATA.cancel_register
+            del PARENT_TASK_DATA.task_register
+
+    def report_result(result: Outcome[T_Retval]) -> None:
+        def release_then_unwrap() -> T_Retval:
+            try:
+                return result.unwrap()
+            finally:
+                limiter.release_on_behalf_of(borrower)
+
+        captured_result = capture(release_then_unwrap)
+        if task_register[0] is not None:
+            waiting[0] = False
+            trio.lowlevel.reschedule(task_register[0], Value(captured_result))
+
+    def deliver_result(result: Outcome[T_Retval]) -> None:
+        with suppress(trio.RunFinishedError):
+            token.run_sync_soon(report_result, result)
+
+    def abort(raise_cancel: Callable[[], NoReturn]) -> Abort:
+        cancel_register[0] = raise_cancel
+        if abandoned[0]:
+            task_register[0] = None
+            waiting[0] = False
+            return Abort.SUCCEEDED
+
+        return Abort.FAILED
+
+    try:
+        await limiter.acquire_on_behalf_of(borrower)
+        try:
+            start_thread_soon(worker_fn, deliver_result, thread_name)
+        except BaseException:
+            limiter.release_on_behalf_of(borrower)
+            raise
+
+        while True:
+            waiting[0] = True
+            try:
+                message = await wait_task_rescheduled(abort)
+            finally:
+                waiting[0] = False
+
+            if isinstance(message, Outcome):
+                return message.unwrap()
+            elif isinstance(message, Run):
+                await message.run()
+            elif isinstance(message, RunSync):
+                message.run_sync()
+            else:
+                raise TypeError(f"unexpected message from worker thread: {message!r}")
+    finally:
+        unregister()
+
+
 class TrioTaskInfo(TaskInfo):
     def __init__(self, task: trio.lowlevel.Task):
         parent_id = None
@@ -1155,6 +1282,16 @@ class TrioBackend(AsyncBackend):
         abandon_on_cancel: bool = False,
         limiter: BaseCapacityLimiter | None = None,
     ) -> T_Retval:
+        task_group = _current_task_group.get()
+        if (
+            not abandon_on_cancel
+            and isinstance(task_group, TaskGroup)
+            and task_group._root_task is current_root_task()
+            and not task_group.cancel_scope.cancel_called
+            and cls.current_effective_deadline() != -math.inf
+        ):
+            return await _run_sync_abandonable(func, args, limiter, task_group)
+
         def wrapper() -> T_Retval:
             with claim_worker_thread(TrioBackend, token):
                 return func(*args)

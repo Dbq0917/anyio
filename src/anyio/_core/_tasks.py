@@ -3,10 +3,12 @@ from __future__ import annotations
 import math
 import sys
 from collections.abc import (
+    Callable,
     Coroutine,
     Generator,
 )
 from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum, auto
 from inspect import iscoroutine
 from types import TracebackType
@@ -27,6 +29,10 @@ T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
 T_startval_co = TypeVar("T_startval_co", covariant=True, default=Never)
 PosArgsT = TypeVarTuple("PosArgsT")
+
+_current_task_group: ContextVar[TaskGroup | None] = ContextVar(
+    "_current_task_group", default=None
+)
 
 
 class _IgnoredTaskStatus(TaskStatus[object]):
@@ -290,6 +296,7 @@ class TaskHandle(Generic[T_co, T_startval_co]):
         "_exception",
         "_finished_event",
         "_name",
+        "_on_error",
         "_return_value",
         "_start_value",
     )
@@ -302,11 +309,13 @@ class TaskHandle(Generic[T_co, T_startval_co]):
         coro: Coroutine[Any, Any, T_co],
         name: object,
         cancel_scope: CancelScope | None = None,
+        on_error: Callable[[], None] | None = None,
     ) -> None:
         from ._synchronization import Event
 
         self._coro = coro
         self._cancel_scope = cancel_scope if cancel_scope is not None else CancelScope()
+        self._on_error = on_error
         self._finished_event = Event()
         self._exception: BaseException | None = None
 
@@ -326,6 +335,11 @@ class TaskHandle(Generic[T_co, T_startval_co]):
                 retval = await self._coro
             except BaseException as exc:
                 self._exception = exc
+                if self._on_error is not None and not isinstance(
+                    exc, self._cancelled_exc_class
+                ):
+                    self._on_error()
+
                 raise
             else:
                 self._return_value = retval
