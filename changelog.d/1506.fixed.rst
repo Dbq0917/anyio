@@ -1,0 +1,2 @@
+Fixed direct cancellation of an asyncio host task not being visible to
+``from_thread.check_cancelled()`` in a worker thread.

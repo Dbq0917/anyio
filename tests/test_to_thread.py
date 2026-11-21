@@ -532,6 +532,41 @@ async def test_asyncio_cancel_native_task() -> None:
 
 
 @pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_asyncio_cancel_native_task_notifies_worker() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    outcome: list[BaseException | None] = []
+
+    def thread_worker() -> None:
+        started.set()
+        assert release.wait(5)
+        try:
+            from_thread.check_cancelled()
+        except BaseException as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+        finally:
+            finished.set()
+
+    task = asyncio.create_task(
+        to_thread.run_sync(thread_worker, abandon_on_cancel=True)
+    )
+    while not started.is_set():
+        await checkpoint()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    release.set()
+    assert await to_thread.run_sync(finished.wait, 5)
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], asyncio.CancelledError)
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
 async def test_asyncio_worker_reused_after_cancelled_call(
     asyncio_worker_pool: Any,
     mocker: MockerFixture,

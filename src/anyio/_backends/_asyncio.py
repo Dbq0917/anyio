@@ -876,6 +876,21 @@ class TaskGroup(abc.TaskGroup):
 _Retval_Queue_Type = tuple[T_Retval | None, BaseException | None]
 
 
+class _WorkerThreadFuture(asyncio.Future[T_Retval]):
+    __slots__ = ("cancel_event",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_event = threading.Event()
+
+    def cancel(self, msg: Any = None) -> bool:
+        cancelled = super().cancel(msg)
+        if cancelled:
+            self.cancel_event.set()
+
+        return cancelled
+
+
 class WorkerThreadPool:
     def __init__(self, max_idle_time: float = 10) -> None:
         self.max_idle_time = max_idle_time
@@ -892,7 +907,7 @@ class WorkerThreadPool:
         args: tuple[*PosArgsT],
         cancel_scope: CancelScope,
     ) -> asyncio.Future[T_Retval]:
-        future = asyncio.Future[T_Retval]()
+        future = _WorkerThreadFuture[T_Retval]()
         with self.lock:
             if self.stopping:
                 raise RuntimeError("The worker thread pool is shutting down")
@@ -948,7 +963,8 @@ class WorkerThread(Thread):
         super().__init__(name="AnyIO worker thread", daemon=False, **kwargs)
         self.pool = pool
         self.queue: Queue[
-            tuple[Context, Callable, tuple, asyncio.Future, CancelScope] | None
+            tuple[Context, Callable, tuple, _WorkerThreadFuture[Any], CancelScope]
+            | None
         ] = Queue(2)
 
     @staticmethod
@@ -967,21 +983,24 @@ class WorkerThread(Thread):
                 future.set_result(result)
 
     def _run_job(
-        self, item: tuple[Context, Callable, tuple, asyncio.Future, CancelScope]
+        self,
+        item: tuple[Context, Callable, tuple, _WorkerThreadFuture[Any], CancelScope],
     ) -> bool:
         context, func, args, future, cancel_scope = item
         loop = future.get_loop()
         result = None
         exception: BaseException | None = None
         with claim_worker_thread(AsyncIOBackend, loop):
-            if not future.cancelled():
+            if not future.cancel_event.is_set():
                 threadlocals.current_cancel_scope = cancel_scope
+                threadlocals.current_cancel_event = future.cancel_event
                 try:
                     result = context.run(func, *args)
                 except BaseException as exc:
                     exception = exc
                 finally:
                     del threadlocals.current_cancel_scope
+                    del threadlocals.current_cancel_event
 
         # Make the worker available before delivering the result, so sequential
         # calls can reuse it even if the event loop receives the result immediately.
@@ -2638,6 +2657,12 @@ class AsyncIOBackend(AsyncBackend):
 
     @classmethod
     def check_cancelled(cls) -> None:
+        cancel_event = getattr(threadlocals, "current_cancel_event", None)
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError(
+                "Cancelled via cancel scope (the host task was cancelled)"
+            )
+
         scope: CancelScope | None = threadlocals.current_cancel_scope
         while scope is not None:
             if scope.cancel_called:

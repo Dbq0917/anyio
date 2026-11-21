@@ -198,8 +198,9 @@ Reacting to cancellation in worker threads
 ------------------------------------------
 
 While there is no mechanism in Python to cancel code running in a thread, AnyIO provides
-a mechanism that allows user code to voluntarily check if the host task's scope has been
-cancelled, and if it has, raise a cancellation exception. This can be done by simply
-calling :func:`from_thread.check_cancelled`:
+a mechanism that allows user code to voluntarily check if the host task has been
+cancelled, and if it has, raise a cancellation exception. This covers both cancel scopes
+and direct cancellation of the host task. This can be done by simply calling
+:func:`from_thread.check_cancelled`:
 
 .. literalinclude:: snippets/threads/check_cancelled.py
